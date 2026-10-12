@@ -8,3 +8,4 @@ logs/
 *.log
 *.enc
 *.key
+keys/
