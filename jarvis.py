@@ -1,21 +1,28 @@
 import sys
+import json
 import subprocess
 import requests
 from rich.console import Console
 from rich.panel import Panel
-from rich.markdown import Markdown
 
 console = Console()
 
-# Ollama'nın yerel API endpoint'i
 OLLAMA_URL = "http://localhost:11434/api/generate"
 MODEL_NAME = "llama3.2:3b"
 
-# Sistem rolü ve davranış kuralları
+# Yalnızca çalıştırılmasına izin verilen güvenli komutlar (Allowlist)
+ALLOWLIST = ["df", "free", "uptime", "ss", "ip", "ps", "whoami", "uname"]
+
 SYSTEM_PROMPT = """
 Sen Linux ve siber güvenlik odaklı bir terminal asistanısın. Adın JARVIS.
-Kullanıcının sistem, analiz ve güvenlik sorularına teknik, öz ve net yanıtlar ver.
-Önerdiğin komutları mutlaka ```bash blokları içerisine yaz.
+Kullanıcının sorusuna göre bir sistem analizi komutu öner.
+Cevabını YALNIZCA ve KESİNLİKLE aşağıdaki JSON şemasında ver. Asla markdown veya ekstra metin ekleme.
+
+{
+  "thought": "Komutu seçme gerekçen (Türkçe)",
+  "command": "Önerilen saf Linux komutu",
+  "risk_level": "low veya medium veya high"
+}
 """
 
 def sor_jarvis(soru):
@@ -23,24 +30,22 @@ def sor_jarvis(soru):
         "model": MODEL_NAME,
         "system": SYSTEM_PROMPT,
         "prompt": soru,
-        "stream": False
+        "format": "json",
+        "stream": False,
+        "options": {
+            "num_thread": 2,
+            "num_ctx": 2048
+        }
     }
     
-    with console.status("[bold green]Jarvis analiz ediyor...[/bold green]"):
+    with console.status("[bold green]Jarvis analiz ediyor (CPU kısıtlamalı)...[/bold green]"):
         try:
-            res = requests.post(OLLAMA_URL, json=payload, timeout=60)
+            res = requests.post(OLLAMA_URL, json=payload, timeout=90)
             res.raise_for_status()
             return res.json().get("response", "")
         except Exception as e:
-            console.print(f"[bold red]Bağlantı Hatası:[/bold red] Ollama servisine erişilemedi ({e})")
+            console.print(f"[bold red]Bağlantı Hatası:[/bold red] ({e})")
             return None
-
-def komut_ayikla(metin):
-    # Modelin ürettiği metin içerisindeki ```bash ... ``` komut bloğunu çeker
-    if "```bash" in metin:
-        parcalar = metin.split("```bash")
-        return parcalar[1].split("```")[0].strip()
-    return None
 
 def main():
     if len(sys.argv) < 2:
@@ -48,24 +53,45 @@ def main():
         return
 
     girdi = " ".join(sys.argv[1:])
-    cevap = sor_jarvis(girdi)
+    yanit_ham = sor_jarvis(girdi)
 
-    if not cevap:
+    if not yanit_ham:
         return
 
-    # Yanıtı terminalde çerçeveli panel olarak render eder
-    console.print(Panel(Markdown(cevap), title="[bold cyan]JARVIS CO-PILOT[/bold cyan]", border_style="cyan"))
+    try:
+        veri = json.loads(yanit_ham)
+    except json.JSONDecodeError:
+        console.print("[bold red]Hata:[/bold red] Model geçerli bir JSON çıktısı üretemedi.")
+        return
 
-    # Human-in-the-Loop: Komut çalıştırma onayı
-    komut = komut_ayikla(cevap)
-    if komut:
-        console.print(f"\n[bold yellow]Önerilen Komut:[/bold yellow] [bold white]{komut}[/bold white]")
-        onay = input("\nBu komut çalıştırılsın mı? (e/h): ").strip().lower()
-        if onay == "e":
-            console.print("[green]Komut yürütülüyor...[/green]\n")
-            subprocess.run(komut, shell=True)
-        else:
-            console.print("[red]İşlem iptal edildi.[/red]")
+    gerekce = veri.get("thought", "Belirtilmedi")
+    komut = veri.get("command", "").strip()
+    risk = veri.get("risk_level", "unknown").upper()
+
+    panel_icerik = (
+        f"[bold cyan]Analiz / Gerekçe:[/bold cyan] {gerekce}\n"
+        f"[bold yellow]Önerilen Komut:[/bold yellow] [white]{komut}[/white]\n"
+        f"[bold magenta]Risk Seviyesi:[/bold magenta] {risk}"
+    )
+    console.print(Panel(panel_icerik, title="[bold cyan]JARVIS GÜVENLİK ANALİZİ[/bold cyan]", border_style="cyan"))
+
+    if not komut:
+        console.print("[yellow]Çalıştırılacak bir komut önerilmedi.[/yellow]")
+        return
+
+    # Allowlist (Beyaz Liste) Kontrolü
+    ana_komut = komut.split()[0]
+    if ana_komut not in ALLOWLIST:
+        console.print(f"\n[bold red][ENGEL][/bold red] '{ana_komut}' komutu Beyaz Liste'de (Allowlist) yer almıyor! Güvenlik gereği yürütülemez.")
+        return
+
+    # Human-in-the-Loop: Kullanıcı Onayı
+    onay = input(f"\n'{komut}' komutu çalıştırılsın mı? (e/h): ").strip().lower()
+    if onay == "e":
+        console.print("[green]Komut yürütülüyor...[/green]\n")
+        subprocess.run(komut, shell=True)
+    else:
+        console.print("[red]İşlem iptal edildi.[/red]")
 
 if __name__ == "__main__":
     main()
