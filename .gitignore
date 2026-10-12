@@ -1,5 +1,10 @@
-__pycache__/
-*.pyc
-.env
-*.log
+# Python sanal ortamı ve önbellekler
 venv/
+__pycache__/
+*.py[cod]
+
+# Güvenlik ve denetim kayıtları (Gizlilik gereği depoya yüklenmez)
+logs/
+*.log
+*.enc
+*.key
