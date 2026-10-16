@@ -3,6 +3,7 @@ import json
 import os
 import time
 import subprocess
+import shlex
 import requests
 import getpass
 from datetime import datetime
@@ -25,14 +26,36 @@ PUB_KEY_FILE = os.path.join(KEY_DIR, "public.pem")
 PRIV_KEY_FILE = os.path.join(KEY_DIR, "private.pem")
 LOG_RETENTION_SECONDS = 7 * 24 * 60 * 60  # 7 Gun
 
-ALLOWLIST = ["df", "free", "uptime", "ss", "ip", "ps", "whoami", "uname", "nmap", "ping", "curl", "dig"]
-YASAKLI_ARGUMANLAR = ["--script=exploit", "--script exploit", "dos", "broadcast-ping"]
+# Beyaz Liste: Yalnizca salt-okunur ve kesif odakli ikili dosyalar
+ALLOWLIST = [
+    "df", "free", "uptime", "ss", "ip", "ps", "whoami", "uname",
+    "nmap", "ping", "curl", "dig", "host", "traceroute", "ffuf"
+]
+
+# Riskli parametre bloklamalari
+YASAKLI_ARGUMANLAR = [
+    "--script=exploit", "--script exploit", "dos", "broadcast-ping",
+    ":(){ :|:& };:", "rm ", "dd ", "mkfs"
+]
+
+# Izin verilen guvenli kelime listesi dizinleri (Path Traversal Onlemi)
+ALLOWED_WORDLIST_DIRS = [
+    "/usr/share/wordlists/",
+    "/usr/share/seclists/"
+]
 
 SYSTEM_PROMPT = """
 Sen Linux ve siber guvenlik odakli bir terminal asistanisin. Adin JARVIS.
-Kullanicinin ag kesfi veya sistem analizi talebine uygun salt-okunur bir komut oner.
-Cevabini YALNIZCA asagidaki JSON semasinda ver:
+Kullanicinin ag kesfi veya sistem analizi talebine uygun, calistirilabilir ve hatasiz bir komut oner.
 
+KURALLAR:
+1. Asla '<ag_adresi>', '<target>' veya '<ip>' gibi yer tutucular (placeholder) kullanma.
+   - Kullanici belirli bir IP vermediyse yerel ag icin '192.168.1.0/24' veya localhost icin '127.0.0.1' varsayimini kullan.
+2. Hizli port taramasi istendiginde '-p-' KULLANMA. Yerine '-F' veya varsayilan hizli tarama parametrelerini sec.
+3. Cikti parametrelerini (-oN, -oX) birbirine baglama, gerekmedikce dosya yazma parametresi ekleme (ekrana standart cikti versin).
+4. Web fuzzing (ffuf) oneriyorsan wordlist'i /usr/share/wordlists/ altindan sec ve '-t 20' siniri koy.
+
+Cevabini YALNIZCA asagidaki JSON semasinda ver:
 {
   "thought": "Komutun secilme gerekcesi",
   "command": "Onerilen saf Linux komutu",
@@ -41,19 +64,19 @@ Cevabini YALNIZCA asagidaki JSON semasinda ver:
 """
 
 SYSTEM_ANALIZ_PROMPT = """
-Sen tecrubeli bir sizma testi (pentest) ve zafiyet analizi uzmanisin.
-Sana verilen port/servis taramasi ciktisini incele.
+Sen tecrubeli bir guvenlik analizi uzmanisin.
+Sana verilen tarama ciktisini incele.
 Gereksiz sozcuk tekrarlarindan kacin. Dogrudan teknige odaklan.
 Yalnizca su 3 baslik altinda, her baslik icin en fazla 2 net madde yaz:
 
-### 1. Saldiri Vektorleri
-- Hedeflenen zafiyet veya sizma noktasi
+### 1. Saldiri Yuzeyi ve Tespitler
+- Acik portlar, servisler veya bulunan dizinler
 
-### 2. Teknik Dogrulama (Pentest)
-- Servisin acigini test etmek icin izlenecek yontem
+### 2. Teknik Degerlendirme
+- Servislerin yapilandirmasina dair dikkat edilmesi gereken noktalar
 
 ### 3. Sikilastirma (Hardening)
-- Servisi yerel makinede guvene alma adimi
+- Servisi veya sistemi guvene alma adimi
 """
 
 def anahtarlari_hazirla():
@@ -71,11 +94,9 @@ def anahtarlari_hazirla():
                 console.print("[red]Parolalar eslesmedi, tekrar deneyin.[/red]")
                 parola = ""
 
-        # RSA 2048 Uretimi
         private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
         public_key = private_key.public_key()
 
-        # Private Key diske parola ile sifrelenerek yazilir
         pem_private = private_key.private_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PrivateFormat.PKCS8,
@@ -84,7 +105,6 @@ def anahtarlari_hazirla():
         with open(PRIV_KEY_FILE, "wb") as f:
             f.write(pem_private)
 
-        # Public Key diske yazilir (kilitlemek icin kullanilir)
         pem_public = public_key.public_bytes(
             encoding=serialization.Encoding.PEM,
             format=serialization.PublicFormat.SubjectPublicKeyInfo
@@ -114,7 +134,7 @@ def log_rotasyonu():
                     pass
 
 def log_kaydet(girdi, komut, durum, stdout_metni=""):
-    """Hibrit sifreleme: Veri tek kullanimlik Fernet ile, Fernet anahtari RSA Public Key ile kilitlenir."""
+    """Hibrit zarf sifreleme ile log kaydeder."""
     zaman_damgasi = datetime.now().strftime("%Y%m%d_%H%M%S")
     dosya_adi = os.path.join(LOG_DIR, f"audit_{zaman_damgasi}.json.enc")
 
@@ -126,12 +146,10 @@ def log_kaydet(girdi, komut, durum, stdout_metni=""):
         "output_preview": stdout_metni[:500] if stdout_metni else ""
     }
 
-    # 1. Tek kullanimlik simetrik anahtar uret ve veriyi sifrele
     tek_seferlik_anahtar = Fernet.generate_key()
     fernet = Fernet(tek_seferlik_anahtar)
     sifreli_icerik = fernet.encrypt(json.dumps(log_verisi, ensure_ascii=False).encode("utf-8"))
 
-    # 2. Simetrik anahtari RSA Public Key ile kilitle
     public_key = public_key_al()
     sifreli_simetrik_anahtar = public_key.encrypt(
         tek_seferlik_anahtar,
@@ -142,7 +160,6 @@ def log_kaydet(girdi, komut, durum, stdout_metni=""):
         )
     )
 
-    # 3. Iki parcayi birlikte dosyaya kaydet
     paket = {
         "encrypted_key": sifreli_simetrik_anahtar.hex(),
         "encrypted_data": sifreli_icerik.decode("latin1")
@@ -159,7 +176,6 @@ def loglari_oku():
         console.print("[yellow]Henuz kaydedilmis bir log bulunamadi.[/yellow]")
         return
 
-    # Master Parola sorulur
     parola = getpass.getpass("Loglarin kilidini acmak icin Master Parolayi girin: ")
 
     try:
@@ -185,7 +201,6 @@ def loglari_oku():
                 sifreli_simetrik_anahtar = bytes.fromhex(paket["encrypted_key"])
                 sifreli_icerik = paket["encrypted_data"].encode("latin1")
 
-                # RSA Private Key ile tek kullanimlik simetrik anahtari coz
                 simetrik_anahtar = private_key.decrypt(
                     sifreli_simetrik_anahtar,
                     padding.OAEP(
@@ -237,7 +252,7 @@ def analiz_et(cikis_metni):
     payload = {
         "model": MODEL_NAME,
         "system": SYSTEM_ANALIZ_PROMPT,
-        "prompt": f"Tarama Sonucu:\n{cikis_metni}\n\nTeknik analizi yap:",
+        "prompt": f"Tarama Sonucu:\n{cikis_metni[:1500]}\n\nTeknik analizi yap:",
         "stream": False,
         "options": {
             "num_thread": 2,
@@ -256,16 +271,32 @@ def analiz_et(cikis_metni):
         except Exception as e:
             return f"Analiz hatasi: {e}"
 
-def guvenlik_kontrolu(komut):
-    parcalar = komut.split()
-    ana_komut = parcalar[0] if parcalar else ""
+def guvenlik_kontrolu(komut_parcalari):
+    """Tokenize edilmis argumanlar uzerinde calisir (shell=False guvenligi)."""
+    if not komut_parcalari:
+        return False, "Bos komut calistirilamaz."
 
+    ana_komut = komut_parcalari[0]
+
+    # 1. Allowlist kontrolu
     if ana_komut not in ALLOWLIST:
         return False, f"'{ana_komut}' Beyaz Liste'de (Allowlist) yer almiyor!"
 
+    tam_metin = " ".join(komut_parcalari)
     for yasakli in YASAKLI_ARGUMANLAR:
-        if yasakli in komut:
-            return False, f"'{yasakli}' gibi riskli argumanlar engellendi!"
+        if yasakli in tam_metin:
+            return False, f"'{yasakli}' iceren riskli arguman engellendi!"
+
+    # 2. Wordlist yol kontrolu (ffuf / gobuster parametreleri icin)
+    if "-w" in komut_parcalari:
+        try:
+            w_index = komut_parcalari.index("-w")
+            wordlist_path = komut_parcalari[w_index + 1].split(":")[0]  # ffuf formatinda /path:FUZZ olabilir
+            gecerli_yol = any(os.path.abspath(wordlist_path).startswith(dizin) for dizin in ALLOWED_WORDLIST_DIRS)
+            if not gecerli_yol:
+                return False, f"Guvenlik Engeli: '{wordlist_path}' izinli bir wordlist dizininde degil!"
+        except IndexError:
+            return False, "Gecersiz wordlist parametresi."
 
     return True, "Guvenli"
 
@@ -294,43 +325,66 @@ def main():
         return
 
     gerekce = veri.get("thought", "Belirtilmedi")
-    komut = veri.get("command", "").strip()
+    komut_metni = veri.get("command", "").strip()
     risk = veri.get("risk_level", "unknown").upper()
 
     panel_icerik = (
         f"[bold cyan]Gerekce:[/bold cyan] {gerekce}\n"
-        f"[bold yellow]Onerilen Komut:[/bold yellow] [white]{komut}[/white]\n"
+        f"[bold yellow]Onerilen Komut:[/bold yellow] [white]{komut_metni}[/white]\n"
         f"[bold magenta]Risk Seviyesi:[/bold magenta] {risk}"
     )
     console.print(Panel(panel_icerik, title="[bold cyan]JARVIS GOREV TANIMI[/bold cyan]", border_style="cyan"))
 
-    if not komut:
+    if not komut_metni:
         return
 
-    gecerli, mesaj = guvenlik_kontrolu(komut)
+    # Komut dizisine ayirma (shlex ile guvenli tokenizasyon)
+    try:
+        komut_parcalari = shlex.split(komut_metni)
+    except ValueError as e:
+        console.print(f"[bold red]Komut ayristirma hatasi:[/bold red] {e}")
+        return
+
+    gecerli, mesaj = guvenlik_kontrolu(komut_parcalari)
     if not gecerli:
         console.print(f"\n[bold red][ENGEL][/bold red] {mesaj}")
-        log_kaydet(girdi, komut, f"BLOCKED: {mesaj}")
+        log_kaydet(girdi, komut_metni, f"BLOCKED: {mesaj}")
         return
 
-    onay = input(f"\n'{komut}' komutu calistirilsin mi? (e/h): ").strip().lower()
+    onay = input(f"\n'{komut_metni}' komutu calistirilsin mi? (e/h): ").strip().lower()
     if onay == "e":
-        console.print("[green]Kesif yurutuluyor...[/green]\n")
-        sonuc = subprocess.run(komut, shell=True, text=True, captureOutput=True) if hasattr(subprocess, "captureOutput") else subprocess.run(komut, shell=True, text=True, capture_output=True)
-        
-        if sonuc.stdout:
-            console.print(Panel(sonuc.stdout.strip(), title="[bold green]HAM TARAMA CIKTISI[/bold green]", border_style="green"))
-            yorum = analiz_et(sonuc.stdout)
-            console.print(Panel(Markdown(yorum), title="[bold magenta]JARVIS ZAFIYET VE SALDIRI YUZEYI RAPORU[/bold magenta]", border_style="magenta"))
-            log_kaydet(girdi, komut, "EXECUTED", sonuc.stdout)
-        
-        if sonuc.stderr:
-            console.print(f"[red]Hata (stderr):[/red] {sonuc.stderr.strip()}")
-            log_kaydet(girdi, komut, "ERROR", sonuc.stderr)
+        console.print("[green]Kesif yurutuluyor (Zaman asimi: 120s)...[/green]\n")
+        try:
+            # shell=False ve 120s timeout ile komut calistirma
+            sonuc = subprocess.run(
+                komut_parcalari,
+                shell=False,
+                text=True,
+                capture_output=True,
+                timeout=120
+            )
+
+            if sonuc.stdout:
+                console.print(Panel(sonuc.stdout.strip()[:2000], title="[bold green]HAM TARAMA CIKTISI[/bold green]", border_style="green"))
+                yorum = analiz_et(sonuc.stdout)
+                console.print(Panel(Markdown(yorum), title="[bold magenta]JARVIS ZAFIYET VE SALDIRI YUZEYI RAPORU[/bold magenta]", border_style="magenta"))
+                log_kaydet(girdi, komut_metni, "EXECUTED", sonuc.stdout)
+
+            if sonuc.stderr:
+                console.print(f"[yellow]Bilgi / stderr:[/yellow] {sonuc.stderr.strip()[:500]}")
+                if not sonuc.stdout:
+                    log_kaydet(girdi, komut_metni, "STDERR_ONLY", sonuc.stderr)
+
+        except subprocess.TimeoutExpired:
+            console.print("[bold red][HATA] Komut 120 saniyelik zaman asimina ugradi ve sonlandirildi.[/bold red]")
+            log_kaydet(girdi, komut_metni, "TIMEOUT")
+        except FileNotFoundError:
+            console.print(f"[bold red][HATA] '{komut_parcalari[0]}' sistemi uzerinde bulunamadi.[/bold red]")
+            log_kaydet(girdi, komut_metni, "NOT_FOUND")
             
     else:
         console.print("[red]Islem iptal edildi.[/red]")
-        log_kaydet(girdi, komut, "CANCELLED_BY_USER")
+        log_kaydet(girdi, komut_metni, "CANCELLED_BY_USER")
 
 if __name__ == "__main__":
     main()
